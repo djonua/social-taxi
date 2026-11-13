@@ -1,0 +1,231 @@
+# Социальное такси — сервер: Supabase (минимальный набор) + сайт диспетчерской.
+# Наружу смотрит только Traefik (сеть web):
+#   https://staxi.apsoftgroup.ru/            → сайт (nginx)
+#   https://staxi.apsoftgroup.ru/auth/v1 …   → API (kong)
+# Основано на официальном supabase/docker; убраны studio, storage, analytics, pooler.
+
+name: staxi
+
+services:
+  staxi-site:
+    container_name: staxi-site
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./site:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - web
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=web
+      - traefik.http.routers.staxi.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.staxi.entrypoints=websecure
+      - traefik.http.routers.staxi.tls.certresolver=letsencrypt
+      - traefik.http.routers.staxi.service=staxi
+      - traefik.http.services.staxi.loadbalancer.server.port=80
+      - traefik.http.routers.staxi-http.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.staxi-http.entrypoints=web
+      - traefik.http.routers.staxi-http.middlewares=staxi-https-redirect
+      - traefik.http.middlewares.staxi-https-redirect.redirectscheme.scheme=https
+      - traefik.http.middlewares.staxi-https-redirect.redirectscheme.permanent=true
+
+  staxi-kong:
+    container_name: staxi-kong
+    image: kong/kong:3.9.1
+    restart: unless-stopped
+    networks:
+      - default
+      - web
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      auth:
+        condition: service_healthy
+    volumes:
+      - ./volumes/api/kong.yml:/home/kong/temp.yml:ro,z
+      - ./volumes/api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro,z
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_DNS_NOT_FOUND_TTL: 1
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      KONG_PROXY_ACCESS_LOG: "off"
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_PUBLISHABLE_KEY: ""
+      SUPABASE_SECRET_KEY: ""
+      ANON_KEY_ASYMMETRIC: ""
+      SERVICE_ROLE_KEY_ASYMMETRIC: ""
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+    entrypoint: /home/kong/kong-entrypoint.sh
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=web
+      # Только нужные приложению разделы API; всё остальное уходит на сайт.
+      - traefik.http.routers.staxi-api.rule=Host(`${DOMAIN}`) && (PathPrefix(`/auth/v1`) || PathPrefix(`/rest/v1`) || PathPrefix(`/realtime/v1`) || PathPrefix(`/functions/v1`))
+      - traefik.http.routers.staxi-api.entrypoints=websecure
+      - traefik.http.routers.staxi-api.tls.certresolver=letsencrypt
+      - traefik.http.routers.staxi-api.service=staxi-api
+      - traefik.http.services.staxi-api.loadbalancer.server.port=8000
+
+  auth:
+    container_name: staxi-auth
+    image: supabase/gotrue:v2.186.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: https://${DOMAIN}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      GOTRUE_SITE_URL: https://${DOMAIN}
+      GOTRUE_URI_ALLOW_LIST: ""
+      # Самостоятельная регистрация закрыта: учётные записи создаёт администратор.
+      GOTRUE_DISABLE_SIGNUP: "true"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_SMTP_ADMIN_EMAIL: noreply@${DOMAIN}
+      GOTRUE_SMTP_HOST: localhost
+      GOTRUE_SMTP_PORT: 2500
+      GOTRUE_SMTP_USER: unused
+      GOTRUE_SMTP_PASS: unused
+      GOTRUE_SMTP_SENDER_NAME: staxi
+
+  rest:
+    container_name: staxi-rest
+    image: postgrest/postgrest:v14.6
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: 3600
+    command: ["postgrest"]
+
+  realtime:
+    # Имя должно начинаться с «realtime-dev.» — так Realtime определяет арендатора.
+    container_name: realtime-dev.staxi-realtime
+    image: supabase/realtime:v2.76.5
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sSfL --head -o /dev/null -H \"Authorization: Bearer ${ANON_KEY}\" http://localhost:4000/api/tenants/realtime-dev/health"
+        ]
+      timeout: 5s
+      interval: 30s
+      retries: 3
+      start_period: 10s
+    environment:
+      PORT: 4000
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: supabaserealtime
+      API_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
+      DISABLE_HEALTHCHECK_LOGGING: "true"
+
+  functions:
+    container_name: staxi-functions
+    image: supabase/edge-runtime:v1.71.2
+    restart: unless-stopped
+    volumes:
+      - ./volumes/functions:/home/deno/functions:Z
+      - deno-cache:/root/.cache/deno
+    depends_on:
+      staxi-kong:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      SUPABASE_URL: http://staxi-kong:8000
+      SUPABASE_PUBLIC_URL: https://${DOMAIN}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/postgres
+      VERIFY_JWT: "true"
+    command: ["start", "--main-service", "/home/deno/functions/main"]
+
+  db:
+    container_name: staxi-db
+    image: supabase/postgres:15.8.1.085
+    restart: unless-stopped
+    volumes:
+      - ./volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:Z
+      - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:Z
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      - ./volumes/db/data:/var/lib/postgresql/data:Z
+      - ./volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:Z
+      - ./volumes/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:Z
+      - ./volumes/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:Z
+      - db-config:/etc/postgresql-custom
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: 5432
+      POSTGRES_PORT: 5432
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: postgres
+      POSTGRES_DB: postgres
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: 3600
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "log_min_messages=fatal"]
+
+volumes:
+  db-config:
+  deno-cache:
+
+networks:
+  web:
+    external: true

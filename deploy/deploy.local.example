@@ -1,0 +1,9 @@
+# Куда выкладывать. Скопируйте в deploy/deploy.local и впишите свои значения.
+# Адрес сервера для ssh:
+STAXI_HOST=user@server
+# Папка боевого стека на сервере:
+STAXI_DIR=/srv/staxi
+# Папка демо-стека (необязательно; по умолчанию — STAXI_DIR с окончанием -demo):
+STAXI_DEMO_DIR=/srv/staxi-demo
+# Домен сайта (должен указывать на сервер, сертификат выпускает Traefik):
+STAXI_DOMAIN=staxi.example.ru

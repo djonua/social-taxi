@@ -1,0 +1,14 @@
+.DS_Store
+node_modules/
+dist/
+
+# секреты и локальные настройки
+.env
+.env.*
+!.env.example
+*.local
+driver_app/env.json
+deploy/.env
+deploy/site/
+deploy/backups/
+deploy/volumes/db/data/
